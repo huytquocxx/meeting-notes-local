@@ -1,0 +1,5 @@
+faster-whisper
+soundcard
+numpy
+sherpa-onnx
+mcp<2

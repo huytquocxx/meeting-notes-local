@@ -1,0 +1,5 @@
+.venv/
+models/
+meetings/
+__pycache__/
+*.zip

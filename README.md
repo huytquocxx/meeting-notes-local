@@ -32,6 +32,13 @@ The Mac version is untested: it was built and tested on Windows only.
 3. A ready-made recap request is copied to your clipboard. Paste it into Claude and press Enter.
 4. Files are saved in `meetings/<date_time>/`: audio, `transcript.md`, `recap-request.md`.
 
+## If a recording is interrupted
+Audio is saved to disk while you record, so a crash, a closed window or a forced stop loses only the last
+second or two. To rescue it, run in the project folder:
+`.venv\Scripts\python notes.py recover meetings\<folder>` (Windows) or
+`.venv/bin/python notes.py recover meetings/<folder>` (Mac). It rebuilds the audio and transcribes it.
+Look for `.raw` files in `meetings/<folder>`: they are the unfinished recording.
+
 ## Let Claude run it (Claude tool)
 Claude can then start and stop recordings and read the transcript itself, with no pasting.
 Tools: `start_recording`, `stop_recording`, `recording_status`, `list_meetings`, `get_meeting`.

@@ -57,6 +57,17 @@ def load_wav(path):
         return np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
 
 
+def recover_audio(folder):
+    """Turn the .raw files written during recording into .wav files. Also rescues interrupted recordings."""
+    folder = Path(folder)
+    for raw in folder.glob("*.raw"):
+        samples = np.fromfile(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        if samples.size:
+            save_wav(folder / f"{raw.stem}.wav", samples)
+        raw.unlink()
+    return folder
+
+
 def find_sources():
     """Return ({'mic': device, 'meeting': device or None}, notes). Meeting sound needs a loopback."""
     import soundcard as sc
@@ -100,13 +111,19 @@ class Recorder:
             raise RuntimeError("Already recording.")
         sources, self.notes = find_sources()
         self._stop.clear()
-        self._chunks = {name: [] for name, dev in sources.items() if dev is not None}
+        self._chunks = {name: 0 for name, dev in sources.items() if dev is not None}  # samples written so far
         self.devices = {name: dev.name for name, dev in sources.items() if dev is not None}
+        # Audio is written to disk as it is recorded, so a crash or a forced stop loses only seconds.
+        self.folder = MEETINGS / datetime.now().strftime("%Y-%m-%d_%H%M")
+        self.folder.mkdir(parents=True, exist_ok=True)
 
         def capture(name, device):
-            with device.recorder(samplerate=RATE, channels=1) as rec:
+            with device.recorder(samplerate=RATE, channels=1) as rec, open(self.folder / f"{name}.raw", "wb") as raw:
                 while not self._stop.is_set():
-                    self._chunks[name].append(rec.record(numframes=CHUNK)[:, 0])
+                    block = rec.record(numframes=CHUNK)[:, 0]
+                    self._chunks[name] += block.size
+                    raw.write((np.clip(block, -1.0, 1.0) * 32767).astype(np.int16).tobytes())
+                    raw.flush()
 
         self._threads = [
             threading.Thread(target=capture, args=(n, d), daemon=True)
@@ -124,12 +141,7 @@ class Recorder:
         self._threads = []
         if not any(self._chunks.values()):
             raise RuntimeError("Nothing was recorded. Check your microphone and speaker settings.")
-        folder = MEETINGS / datetime.now().strftime("%Y-%m-%d_%H%M")
-        folder.mkdir(parents=True, exist_ok=True)
-        for name, parts in self._chunks.items():
-            if parts:
-                save_wav(folder / f"{name}.wav", np.concatenate(parts))
-        return folder
+        return recover_audio(self.folder)
 
 
 def diarize(samples):
@@ -264,5 +276,12 @@ if __name__ == "__main__":
     r.add_argument("--seconds", type=int)
     t = sub.add_parser("transcribe")
     t.add_argument("folder")
+    rc = sub.add_parser("recover", help="rescue and transcribe a recording that was interrupted")
+    rc.add_argument("folder")
     a = p.parse_args()
-    finish(cli_record(a.seconds) if a.cmd == "record" else a.folder)
+    if a.cmd == "record":
+        finish(cli_record(a.seconds))
+    elif a.cmd == "recover":
+        finish(recover_audio(a.folder))
+    else:
+        finish(a.folder)

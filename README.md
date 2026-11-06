@@ -32,6 +32,26 @@ The Mac version is untested: it was built and tested on Windows only.
 3. A ready-made recap request is copied to your clipboard. Paste it into Claude and press Enter.
 4. Files are saved in `meetings/<date_time>/`: audio, `transcript.md`, `recap-request.md`.
 
+## Automatic meeting detection (Windows only)
+Double-click `watch.bat` once. It stays in the background, like Notion's meeting detection:
+1. When an app such as Teams or Zoom starts using your mic, a card appears at the top of the screen.
+2. Click **Start transcribing**. It never records without that click. A small pill shows the time; drag it anywhere.
+3. Press **Stop**, or just leave the call. A minute after the mic is free, it stops. Text is made during the
+   call, so the transcript is ready shortly after.
+4. The minutes agent starts by itself. A card tells you when `minutes.md` and a draft `follow-up-email.md` are ready.
+
+One-time setup for the agent: run `claude auth login`, copy `agent-config.example.md` to `agent-config.md`, and
+fill it in. The agent follows `agent-instructions.md`. It can only read this folder, write inside `meetings/`,
+and search your Outlook calendar. Everything else, including sending, is refused. It needs the Claude Code login
+and the Microsoft 365 connector. Your transcripts, invite lists and defect details go to Claude each time.
+
+Lines are labelled **You** or **Others**, without Speaker 1, 2, to keep it fast. On a 10-core laptop this took
+about 80% of the processor time it had, so a busy computer can leave some work to finish after the call.
+If live transcription fails, it transcribes the saved audio after the call instead.
+
+It keeps the computer awake while recording and transcribing. Any app using the mic can trigger the card,
+so press Dismiss if it is not a meeting. A log is saved in `meetings/watch.log`.
+
 ## If a recording is interrupted
 Audio is saved to disk while you record, so a crash, a closed window or a forced stop loses only the last
 second or two. To rescue it, run in the project folder:
@@ -70,7 +90,7 @@ Restart Claude, then say "start recording my meeting" and, later, "stop and reca
   each other, or sound alike, will be harder.
 
 ## Good to know
-- The transcript appears after you stop, not live.
+- With `record.bat` or the Claude tool, the transcript is made after you stop, and takes about as long as the meeting.
 - Mixed languages (for example English and Vietnamese): the model picks one language per recording and may
   get the other wrong.
 - `meetings/` holds real audio. Delete folders you no longer need.

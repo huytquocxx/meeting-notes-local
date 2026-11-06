@@ -11,6 +11,7 @@ Windows captures meeting sound directly. On macOS it needs the free BlackHole dr
 import argparse
 import os
 import platform
+import shutil
 import subprocess
 import threading
 import time
@@ -31,9 +32,14 @@ MEETINGS = HERE / "meetings"
 MODEL = "small"  # downloaded once (~460 MB), then cached; use "base" for faster, rougher output
 SEG_MODEL = HERE / "models" / "sherpa-onnx-pyannote-segmentation-3-0" / "model.onnx"
 EMBED_MODEL = HERE / "models" / "embed.onnx"
+DIARIZE_THREADS = 8  # 2.4x faster than 1 thread on a 10-core laptop, same speakers found
+LIVE_THREADS = 4  # speech model threads while a meeting is on
+LIVE_CHUNK = 30 * RATE  # transcribe this much at a time while recording
+LIVE_CUT_WINDOW = 5 * RATE  # end each chunk at the quietest moment in its last seconds, not mid-word
+AGENT_TOOLS = ["Read(./**)", "Glob", "Edit(./meetings/**)", "mcp__claude_ai_Microsoft_365__outlook_calendar_search"]
 
 RECAP_INSTRUCTIONS = (
-    "First, work out who each speaker is. 'You' is me; Speaker 1, 2... are other attendees. "
+    "First, work out who each speaker is. 'You' is me; 'Others' or Speaker 1, 2... are other attendees. "
     "Infer names only from what people say (how they address each other, introductions, roles). "
     "Show a small table: speaker, proposed name, evidence (a short quote with its timestamp), "
     "confidence (sure / guess). For any speaker you cannot name, show 2 or 3 sample lines with "
@@ -133,15 +139,92 @@ class Recorder:
             t.start()
         self.started_at = time.time()
 
-    def stop(self):
-        """Stop recording, save the audio, and return the meeting folder."""
+    def halt(self):
+        """Stop capturing. The audio stays in the .raw files."""
         self._stop.set()
         for t in self._threads:
             t.join(timeout=2)
         self._threads = []
         if not any(self._chunks.values()):
             raise RuntimeError("Nothing was recorded. Check your microphone and speaker settings.")
+
+    def stop(self):
+        """Stop recording, save the audio, and return the meeting folder."""
+        self.halt()
         return recover_audio(self.folder)
+
+
+class LiveRecorder(Recorder):
+    """Records and transcribes at the same time, so the transcript is ready soon after stop().
+
+    No speaker separation: lines are "You" or "Others". If live transcription fails, stop() falls back
+    to the full transcribe(), so a meeting is never lost.
+    """
+
+    def start(self):
+        super().start()
+        self._rows = []
+        self._position = {name: 0 for name in self._chunks}
+        self._language = None
+        self._error = None
+        self._captured = threading.Event()
+        self._worker = threading.Thread(target=self._transcribe_live, daemon=True)
+        self._worker.start()
+
+    def _transcribe_live(self):
+        from faster_whisper import WhisperModel
+
+        try:
+            model = WhisperModel(MODEL, device="cpu", compute_type="int8", cpu_threads=LIVE_THREADS)
+            while not self._captured.is_set():
+                if not any([self._take(model, name, False) for name in self._position]):
+                    time.sleep(1)
+            for name in self._position:
+                while self._take(model, name, True):
+                    pass
+        except Exception as e:
+            self._error = e
+
+    def _take(self, model, name, final):
+        """Transcribe the next chunk of one track. Returns False if there is not enough audio yet."""
+        start = self._position[name]
+        ready = self._chunks[name] - start - (0 if final else CHUNK)  # the newest block may not be on disk yet
+        if ready <= 0 or (ready < LIVE_CHUNK and not final):
+            return False
+        size = min(ready, LIVE_CHUNK)
+        samples = np.fromfile(self.folder / f"{name}.raw", dtype=np.int16, count=size, offset=start * 2)
+        samples = samples.astype(np.float32) / 32768.0
+        if samples.size == 0:
+            return False
+        if ready > size:
+            size = quiet_cut(samples)
+            samples = samples[:size]
+        rows, language = segment_rows(model, samples, "You" if name == "mic" else "Others", start / RATE)
+        self._rows += rows
+        self._language = self._language or language
+        self._position[name] = start + size
+        return True
+
+    def stop(self):
+        try:
+            self.halt()
+        finally:
+            self._captured.set()
+            self._worker.join()
+        folder = recover_audio(self.folder)
+        if self._error:
+            print(f"Live transcription failed ({self._error}). Transcribing the saved audio instead.")
+            transcribe(folder)
+        else:
+            write_transcript(folder, self._rows, self._language)
+        return folder
+
+
+def quiet_cut(samples):
+    """Where to end a chunk: the quietest quarter second inside its last seconds."""
+    step = RATE // 4
+    starts = range(samples.size - LIVE_CUT_WINDOW, samples.size - step, step)
+    return min(starts, key=lambda s: float((samples[s:s + step] ** 2).mean())) + step // 2
 
 
 def diarize(samples):
@@ -150,9 +233,10 @@ def diarize(samples):
 
     config = so.OfflineSpeakerDiarizationConfig(
         segmentation=so.OfflineSpeakerSegmentationModelConfig(
-            pyannote=so.OfflineSpeakerSegmentationPyannoteModelConfig(model=str(SEG_MODEL))
+            pyannote=so.OfflineSpeakerSegmentationPyannoteModelConfig(model=str(SEG_MODEL)),
+            num_threads=DIARIZE_THREADS,
         ),
-        embedding=so.SpeakerEmbeddingExtractorConfig(model=str(EMBED_MODEL)),
+        embedding=so.SpeakerEmbeddingExtractorConfig(model=str(EMBED_MODEL), num_threads=DIARIZE_THREADS),
         clustering=so.FastClusteringConfig(num_clusters=-1, threshold=0.5),
         min_duration_on=0.3,
         min_duration_off=0.5,
@@ -171,6 +255,37 @@ def speaker_at(turns, start, end):
     if best is None and turns:
         best = min(turns, key=lambda t: min(abs(t[0] - start), abs(t[1] - end)))[2]
     return f"Speaker {best}" if best else "Speaker"
+
+
+def segment_rows(model, samples, label, offset=0.0, turns=None):
+    """Transcribe audio. Returns ([(start, who, text)], language, or None if nothing was said)."""
+    segments, info = model.transcribe(samples, vad_filter=True, condition_on_previous_text=False)
+    rows = []
+    for s in segments:
+        if label == "You":  # a quiet, unsure mic line is almost always made-up text from silence or leakage
+            x = samples[int(s.start * RATE): int(s.end * RATE)]
+            quiet = x.size == 0 or float(np.sqrt((x ** 2).mean())) < 0.01
+            if quiet and (s.no_speech_prob > 0.3 or s.avg_logprob < -0.8):
+                continue
+        rows.append((offset + s.start, label or speaker_at(turns, s.start, s.end), s.text.strip()))
+    return rows, info.language if rows else None
+
+
+def write_transcript(folder, rows, language):
+    folder = Path(folder)
+    lines = []
+    for start, who, text in sorted(rows):
+        m, sec = divmod(int(start), 60)
+        lines.append(f"[{m:02d}:{sec:02d}] {who}: {text}")
+    out = folder / "transcript.md"
+    out.write_text(
+        f"# Transcript {folder.name}\n\nDetected language: {language}\n\n" + "\n".join(lines) + "\n",
+        encoding="utf-8",
+    )
+    (folder / "recap-request.md").write_text(
+        RECAP_INSTRUCTIONS + out.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    return out
 
 
 def transcribe(folder, log=print):
@@ -194,33 +309,44 @@ def transcribe(folder, log=print):
     for path, label in tracks:
         log(f"Transcribing {path.name}...")
         samples = load_wav(path)
-        segments, info = model.transcribe(samples, vad_filter=True)
-        language = language or info.language
-        segments = list(segments)
-        turns = diarize(samples) if label is None and segments else []
-        for s in segments:
-            if label == "You":  # a quiet, unsure mic line is almost always made-up text from silence or leakage
-                x = samples[int(s.start * RATE): int(s.end * RATE)]
-                quiet = x.size == 0 or float(np.sqrt((x ** 2).mean())) < 0.01
-                if quiet and (s.no_speech_prob > 0.3 or s.avg_logprob < -0.8):
-                    continue
-            who = label or speaker_at(turns, s.start, s.end)
-            rows.append((s.start, who, s.text.strip()))
+        turns = diarize(samples) if label is None else None
+        track_rows, track_language = segment_rows(model, samples, label, turns=turns)
+        rows += track_rows
+        language = language or track_language
 
-    rows.sort()
-    lines = []
-    for start, who, text in rows:
-        m, sec = divmod(int(start), 60)
-        lines.append(f"[{m:02d}:{sec:02d}] {who}: {text}")
-    out = folder / "transcript.md"
-    out.write_text(
-        f"# Transcript {folder.name}\n\nDetected language: {language}\n\n" + "\n".join(lines) + "\n",
-        encoding="utf-8",
-    )
-    (folder / "recap-request.md").write_text(
-        RECAP_INSTRUCTIONS + out.read_text(encoding="utf-8"), encoding="utf-8"
-    )
+    out = write_transcript(folder, rows, language)
     log(f"Saved {out}")
+    return out
+
+
+def find_claude():
+    """The Claude command: on PATH, or the newest one installed by the desktop app."""
+    installed = Path(os.environ.get("LOCALAPPDATA", HERE)).glob("Claude-Data/claude_*/claude-code/*/*/claude.exe")
+    found = shutil.which("claude") or max(installed, key=lambda p: p.stat().st_mtime, default=None)
+    if not found:
+        raise RuntimeError("Claude Code is not installed.")
+    return str(found)
+
+
+def run_agent(folder):
+    """Run the minutes agent (agent-instructions.md) on one meeting. Returns minutes.md.
+
+    The agent can only read this project, write inside meetings/, and search the Outlook calendar.
+    Every other tool is refused without asking, so nothing can be sent or changed.
+    """
+    folder = Path(folder)
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "ANTHROPIC"))}
+    env["MCP_CONNECTION_NONBLOCKING"] = "false"  # wait for the Outlook connection before starting
+    done = subprocess.run(
+        [find_claude(), "-p", "--tools", "Read,Write,Edit,Glob", "--allowedTools", " ".join(AGENT_TOOLS),
+         "--permission-mode", "dontAsk", "--no-session-persistence", "--model", "sonnet"],
+        input=f"Read agent-instructions.md and follow it exactly. Only process the meeting folder {folder.name}.",
+        capture_output=True, text=True, encoding="utf-8", timeout=1200, cwd=HERE, env=env,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    out = folder / "minutes.md"
+    if not out.exists():
+        raise RuntimeError(f"The agent wrote no minutes: {done.stdout.strip()} {done.stderr.strip()}")
     return out
 
 

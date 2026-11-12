@@ -27,7 +27,7 @@ review-notes.md is for the owner only: Regulatory and compliance considerations 
 Plain, warm, human English. Never use em-dashes.
 
 STEP 5: REVIEW YOUR OWN DRAFT
-Reread the transcript against the draft as a skeptical reader. Check that every decision was really agreed and not only discussed; every action item has a real owner or "not stated"; every name matches the invite or is flagged; every defect number was checked; no fact is missing evidence; the minutes say nothing about who said what, repeat nothing from a shared file, and fit on about one page; no em-dashes. Fix what fails. Do one review pass only.
+Check the draft against the transcript you already read, as a skeptical reader. Do not open files again. Check that every decision was really agreed and not only discussed; every action item has a real owner or "not stated"; every name matches the invite or is flagged; every defect number was checked; no fact is missing evidence; the minutes say nothing about who said what, repeat nothing from a shared file, and fit on about one page; no em-dashes. Fix what fails. Do one review pass only.
 
 STEP 6: SAVE
 Write review-notes.md first. Then write follow-up-email.md: a short draft from the owner to the attendees with subject, thanks, key decisions, action items with owners, and open questions, following the same rules as the minutes. It is for the owner to review and send. Then write minutes.md last, since its presence marks the meeting as done.

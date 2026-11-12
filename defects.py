@@ -13,6 +13,8 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 CELL_TEXT = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+# enough to check a defect number and what it is about; comments and long descriptions cost the agent ~100k tokens
+KEEP = ("Defect ID", "Defect Status", "Defect Severity", "Module Name", "Summary")
 
 
 def defect_folder():
@@ -41,17 +43,36 @@ def sheet_rows(path):
                 shared.append("".join(t.text or "" for t in item.iter(CELL_TEXT + "t")))
         for name in sorted(n for n in book.namelist() if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n)):
             for row in ET.fromstring(book.read(name)).iter(CELL_TEXT + "row"):
-                cells = []
-                for cell in row:
+                cells = {}  # column number: text. Blank cells are missing from the file, so use each cell's own column.
+                for i, cell in enumerate(row):
                     value = cell.find(CELL_TEXT + "v")
                     if cell.get("t") == "s" and value is not None:
-                        cells.append(shared[int(value.text)])
+                        text = shared[int(value.text)]
                     elif value is not None:
-                        cells.append(value.text or "")
+                        text = value.text or ""
                     else:
-                        cells.append("".join(t.text or "" for t in cell.iter(CELL_TEXT + "t")))
-                if any(cells):
-                    yield " | ".join(" ".join(c.split()) for c in cells)
+                        text = "".join(t.text or "" for t in cell.iter(CELL_TEXT + "t"))
+                    cells[column(cell.get("r")) if cell.get("r") else i] = " ".join(text.split())
+                if any(cells.values()):
+                    yield [cells.get(c, "") for c in range(max(cells) + 1)]
+
+
+def column(ref):
+    """Column number of a cell reference: "A7" is 0, "AB7" is 27."""
+    number = 0
+    for letter in re.match(r"[A-Z]+", ref).group():
+        number = number * 26 + ord(letter) - 64
+    return number - 1
+
+
+def short_rows(rows):
+    """Only the KEEP columns, found by the header row of each sheet. Rows before a header stay whole."""
+    keep = None
+    for cells in rows:
+        if "Defect ID" in cells:
+            keep = [cells.index(name) for name in KEEP if name in cells]
+        picked = [cells[i] if i < len(cells) else "" for i in keep] if keep else cells
+        yield " | ".join(picked)
 
 
 def export(meeting_folder):
@@ -64,7 +85,7 @@ def export(meeting_folder):
     if not source:
         return None
     out = meeting_folder / "defects.txt"
-    out.write_text(f"Source: {source.name}\n\n" + "\n".join(sheet_rows(source)) + "\n", encoding="utf-8")
+    out.write_text(f"Source: {source.name}\n\n" + "\n".join(short_rows(sheet_rows(source))) + "\n", encoding="utf-8")
     return out
 
 

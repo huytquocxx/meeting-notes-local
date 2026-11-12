@@ -9,6 +9,7 @@ by voice. Use headphones: with speakers, your mic hears the others and repeats t
 Windows captures meeting sound directly. On macOS it needs the free BlackHole driver (see README).
 """
 import argparse
+import json
 import os
 import platform
 import shutil
@@ -37,6 +38,22 @@ LIVE_THREADS = 4  # speech model threads while a meeting is on
 LIVE_CHUNK = 30 * RATE  # transcribe this much at a time while recording
 LIVE_CUT_WINDOW = 5 * RATE  # end each chunk at the quietest moment in its last seconds, not mid-word
 AGENT_TOOLS = ["Read(./**)", "Glob", "Edit(./meetings/**)", "mcp__claude_ai_Microsoft_365__outlook_calendar_search"]
+# Tools the agent never uses. Each one's description is sent on every run, so blocking them cut the
+# start-up cost from 146k-351k tokens to about 12k. A new connector adds cost until it is listed here.
+M365 = "mcp__claude_ai_Microsoft_365__"
+AGENT_BLOCKED = ["mcp__rea", "mcp__claude_ai_Atlassian_MCP", "mcp__claude_ai_Atlassian_Rovo", "mcp__claude_ai_Claude_Docs",
+                 "mcp__claude_ai_Notion", "mcp__claude_ai_Figma", "mcp__claude_ai_Google_Drive"] + [M365 + t for t in (
+    "chat_message_search find_meeting_availability get_granted_scopes get_me outlook_batch_delete_messages "
+    "outlook_batch_modify_labels outlook_create_draft outlook_create_event outlook_create_filter outlook_create_label "
+    "outlook_create_reply_all_draft outlook_create_reply_draft outlook_delete_draft outlook_delete_event "
+    "outlook_delete_filter outlook_delete_label outlook_email_search outlook_find_available_time outlook_forward_mail "
+    "outlook_modify_labels outlook_modify_thread_labels outlook_respond_to_event outlook_send_draft outlook_send_mail "
+    "outlook_set_vacation outlook_trash_thread outlook_untrash_thread outlook_update_draft outlook_update_event "
+    "outlook_update_label read_resource search_people sharepoint_copy_item sharepoint_create_folder "
+    "sharepoint_delete_item sharepoint_folder_search sharepoint_move_item sharepoint_rename_item sharepoint_search "
+    "sharepoint_update_file sharepoint_upload_file teams_create_chat teams_list_channel_messages teams_list_channels "
+    "teams_list_chats teams_list_teams teams_reply_channel_message teams_send_channel_message teams_send_chat_message"
+).split()]
 
 RECAP_INSTRUCTIONS = (
     "First, work out who each speaker is. 'You' is me; 'Others' or Speaker 1, 2... are other attendees. "
@@ -346,11 +363,19 @@ def run_agent(folder):
     env["MCP_CONNECTION_NONBLOCKING"] = "false"  # wait for the Outlook connection before starting
     done = subprocess.run(
         [find_claude(), "-p", "--tools", "Read,Write,Edit,Glob", "--allowedTools", " ".join(AGENT_TOOLS),
-         "--permission-mode", "dontAsk", "--no-session-persistence", "--model", "sonnet"],
+         "--permission-mode", "dontAsk", "--no-session-persistence", "--model", "sonnet",
+         "--setting-sources", "project", "--disallowedTools", *AGENT_BLOCKED, "--output-format", "json"],
         input=f"Read agent-instructions.md and follow it exactly. Only process the meeting folder {folder.name}.",
         capture_output=True, text=True, encoding="utf-8", timeout=1200, cwd=HERE, env=env,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
+    try:  # so a jump in cost shows in the log
+        usage = json.loads(done.stdout)["usage"]
+        new = usage.get("input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
+        print(f"Minutes agent tokens: {new:,} new, {usage.get('cache_read_input_tokens', 0):,} re-read, "
+              f"{usage.get('output_tokens', 0):,} written")
+    except (ValueError, KeyError):
+        pass
     out = folder / "minutes.md"
     if not out.exists():
         raise RuntimeError(f"The agent wrote no minutes: {done.stdout.strip()} {done.stderr.strip()}")

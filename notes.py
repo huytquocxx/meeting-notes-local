@@ -172,10 +172,8 @@ class LiveRecorder(Recorder):
         self._worker.start()
 
     def _transcribe_live(self):
-        from faster_whisper import WhisperModel
-
         try:
-            model = WhisperModel(MODEL, device="cpu", compute_type="int8", cpu_threads=LIVE_THREADS)
+            model = load_model(cpu_threads=LIVE_THREADS)
             while not self._captured.is_set():
                 if not any([self._take(model, name, False) for name in self._position]):
                     time.sleep(1)
@@ -288,12 +286,21 @@ def write_transcript(folder, rows, language):
     return out
 
 
-def transcribe(folder, log=print):
+def load_model(**options):
+    """The speech model. Uses the copy on disk first: an update check over a stalled network
+    once froze a meeting at "Transcribing..." for hours. Goes online only if it is not downloaded yet."""
     from faster_whisper import WhisperModel
 
+    try:
+        return WhisperModel(MODEL, device="cpu", compute_type="int8", local_files_only=True, **options)
+    except Exception:  # first run
+        return WhisperModel(MODEL, device="cpu", compute_type="int8", **options)
+
+
+def transcribe(folder, log=print):
     folder = Path(folder)
     log(f"Loading speech model '{MODEL}' (first run downloads it)...")
-    model = WhisperModel(MODEL, device="cpu", compute_type="int8")
+    model = load_model()
 
     tracks = []  # (file, fixed label or None to detect speakers)
     if (folder / "mic.wav").exists():
